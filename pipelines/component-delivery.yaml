@@ -10,18 +10,30 @@ metadata:
     # it's pre-applied to the cluster by setup.sh. Every PipelineRun of this
     # Pipeline is created dynamically by tasks/collect-and-dispatch.yaml (one
     # per changed component, via plain `kubectl create` — see
-    # pipelines/dispatch.yaml), which is also what sets the build-* param
-    # values below per run, tiered by ecosystem.
+    # pipelines/dispatch.yaml), which is also what sets the per-run overrides
+    # below, tiered by ecosystem.
     #
     # Covers four resource dimensions, not just cpu/memory — a Go binary and a
     # future Java native-image build don't cost the same on any of them:
-    # - CPU / memory: build-cpu-*/build-memory-* params above, tiered per component
-    #   (see README.md "Resource tiers"), floored/ceilinged by the namespace
-    #   LimitRange in manifests/tekton/quota-tekton.yaml.
-    # - Storage: build-ephemeral-storage-*/layers-size-limit params above (bounds
-    #   the buildpacks /layers scratch volume) plus each PipelineRun's workspace
-    #   PVC size (bounds git-clone + dependency-install disk use, e.g. npm/maven
-    #   pulling gigabytes) — both tiered per component, see README.md.
+    # - CPU / memory: the buildpacks Task's `create` step has a fixed
+    #   "standard"-tier default (tasks/buildpacks.yaml) — NOT a Pipeline param,
+    #   because resources.requests/limits is typed as resource.Quantity in the
+    #   Kubernetes API and rejects a $(params.x) placeholder at `kubectl apply`
+    #   time (unlike plain-string fields such as `image`). Real per-component
+    #   tiering is applied by collect-and-dispatch on each dispatched
+    #   PipelineRun via `spec.taskRunSpecs[].stepSpecs[].computeResources`
+    #   (beta API field — see README.md "Resource tiers"), which carries
+    #   literal, already-resolved values so it isn't subject to that
+    #   constraint. Floored/ceilinged by the namespace LimitRange in
+    #   manifests/tekton/quota-tekton.yaml.
+    # - Storage: each PipelineRun's workspace PVC size (bounds git-clone +
+    #   dependency-install disk use, e.g. npm/maven pulling gigabytes) is set
+    #   per-component by collect-and-dispatch directly on the PipelineRun's
+    #   `spec.workspaces` — that field was never param-typed, so it tiers
+    #   cleanly. The buildpacks Task's `/layers` scratch volume is a fixed,
+    #   generous shared cap instead (same Quantity constraint as above applies
+    #   to `emptyDir.sizeLimit`, and Tekton's stepSpecs override only touches
+    #   step compute resources, not Task volumes) — see tasks/buildpacks.yaml.
     # - Network bandwidth: best-effort kubernetes.io/{e,in}gress-bandwidth
     #   annotations, set by collect-and-dispatch on each dispatched
     #   PipelineRun's own metadata (Tekton propagates PipelineRun annotations
@@ -38,7 +50,7 @@ metadata:
     #   the component-delivery runs collect-and-dispatch creates directly, so
     #   the namespace ResourceQuota/LimitRange above is what actually throttles
     #   concurrent component builds (pods queue Pending, none fail).
-    saritasa.dev/resource-scarcity-control: "manifests/tekton/quota-tekton.yaml, per-component tiers set by tasks/collect-and-dispatch.yaml, documented in README.md"
+    saritasa.dev/resource-scarcity-control: "manifests/tekton/quota-tekton.yaml, per-component tiers set by tasks/collect-and-dispatch.yaml via taskRunSpecs, documented in README.md"
 spec:
   description: >-
     Builds and delivers a single buildpack-ready component: clones the repo at
@@ -80,38 +92,6 @@ spec:
       type: string
       description: Kubernetes namespace where the Deployment lives
       default: dev
-    # Resource-tier params (see saritasa.dev/resource-tier annotation above):
-    # each PipelineRun overrides these to match its component's real dependency
-    # footprint (Go vs. Node vs. a future Java/native-image component) instead
-    # of every component paying for — or being capped to — the same footprint.
-    - name: build-cpu-request
-      type: string
-      description: "CPU request for the buildpacks create step (resource tier)"
-      default: "500m"
-    - name: build-cpu-limit
-      type: string
-      description: "CPU limit for the buildpacks create step (resource tier)"
-      default: "1"
-    - name: build-memory-request
-      type: string
-      description: "Memory request for the buildpacks create step (resource tier)"
-      default: "512Mi"
-    - name: build-memory-limit
-      type: string
-      description: "Memory limit for the buildpacks create step (resource tier)"
-      default: "768Mi"
-    - name: build-ephemeral-storage-request
-      type: string
-      description: "Ephemeral (node-local scratch disk) storage request for the buildpacks create step"
-      default: "512Mi"
-    - name: build-ephemeral-storage-limit
-      type: string
-      description: "Ephemeral (node-local scratch disk) storage limit for the buildpacks create step — caps dependency-install blowups (e.g. npm/maven pulling gigabytes)"
-      default: "1Gi"
-    - name: layers-size-limit
-      type: string
-      description: "Size cap on the buildpacks /layers emptyDir volume (build output + downloaded dependency layers)"
-      default: "1Gi"
   workspaces:
     - name: source
       description: PVC shared across all pipeline steps
@@ -162,20 +142,6 @@ spec:
           value: "1001"
         - name: GROUP_ID
           value: "1000"
-        - name: BUILD_CPU_REQUEST
-          value: $(params.build-cpu-request)
-        - name: BUILD_CPU_LIMIT
-          value: $(params.build-cpu-limit)
-        - name: BUILD_MEMORY_REQUEST
-          value: $(params.build-memory-request)
-        - name: BUILD_MEMORY_LIMIT
-          value: $(params.build-memory-limit)
-        - name: BUILD_EPHEMERAL_STORAGE_REQUEST
-          value: $(params.build-ephemeral-storage-request)
-        - name: BUILD_EPHEMERAL_STORAGE_LIMIT
-          value: $(params.build-ephemeral-storage-limit)
-        - name: LAYERS_SIZE_LIMIT
-          value: $(params.layers-size-limit)
 
     - name: rollout
       runAfter: [build-image]

@@ -46,24 +46,6 @@ spec:
       default: "1000"
     - name: PLATFORM_DIR
       default: empty-dir
-    # Resource-tier knobs (see saritasa.dev/resource-tier annotation on the
-    # calling Pipeline/PipelineRun for the rationale). Defaults below are the
-    # "standard" tier — components with a heavier or lighter dependency
-    # footprint override these from the Pipeline's build-* params.
-    - name: BUILD_CPU_REQUEST
-      default: "500m"
-    - name: BUILD_CPU_LIMIT
-      default: "1"
-    - name: BUILD_MEMORY_REQUEST
-      default: "512Mi"
-    - name: BUILD_MEMORY_LIMIT
-      default: "768Mi"
-    - name: BUILD_EPHEMERAL_STORAGE_REQUEST
-      default: "512Mi"
-    - name: BUILD_EPHEMERAL_STORAGE_LIMIT
-      default: "1Gi"
-    - name: LAYERS_SIZE_LIMIT
-      default: "1Gi"
 
   results:
     - name: APP_IMAGE_DIGEST
@@ -129,15 +111,23 @@ spec:
       # already gives us this for free after the first build.
       imagePullPolicy: IfNotPresent
       command: ["/cnb/lifecycle/creator"]
+      # "standard"-tier defaults. NOT parameterized: resources.requests/limits
+      # are typed as resource.Quantity in the Kubernetes API, so a Tekton
+      # $(params.x) placeholder here fails admission validation at `kubectl
+      # apply` time (it isn't deferred like $(params.x) in `image`/`args` is —
+      # those are plain strings, this isn't). Real per-component tiering is
+      # applied per PipelineRun via spec.taskRunSpecs[].stepSpecs, which sets
+      # literal (already-resolved) values — see
+      # tasks/collect-and-dispatch.yaml and README.md "Resource tiers".
       resources:
         requests:
-          cpu: $(params.BUILD_CPU_REQUEST)
-          memory: $(params.BUILD_MEMORY_REQUEST)
-          ephemeral-storage: $(params.BUILD_EPHEMERAL_STORAGE_REQUEST)
+          cpu: "500m"
+          memory: "512Mi"
+          ephemeral-storage: "512Mi"
         limits:
-          cpu: $(params.BUILD_CPU_LIMIT)
-          memory: $(params.BUILD_MEMORY_LIMIT)
-          ephemeral-storage: $(params.BUILD_EPHEMERAL_STORAGE_LIMIT)
+          cpu: "1"
+          memory: "768Mi"
+          ephemeral-storage: "1Gi"
       env:
         - name: DOCKER_CONFIG
           value: $(workspaces.dockerconfig.path)
@@ -187,5 +177,12 @@ spec:
       emptyDir:
         sizeLimit: 256Mi
     - name: layers-dir
+      # Fixed, not tiered: emptyDir.sizeLimit is also a resource.Quantity
+      # field (same admission-time constraint as the step resources above).
+      # Unlike a request, a ceiling doesn't reserve anything — a generous
+      # shared cap across all tiers still stops a genuine runaway (e.g. an
+      # accidental recursive dependency install) without needing per-run
+      # overrides for a volume, which Tekton's stepSpecs mechanism doesn't
+      # cover (it only overrides step compute resources, not Task volumes).
       emptyDir:
-        sizeLimit: $(params.LAYERS_SIZE_LIMIT)
+        sizeLimit: 4Gi
