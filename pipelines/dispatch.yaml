@@ -9,35 +9,45 @@ metadata:
     # original design: 6 hardcoded .tekton/*.yaml files, one per known
     # component — doesn't scale, and moving/renaming a component's folder or
     # adding a new one under an existing ecosystem required editing Tekton
-    # config). This Pipeline is the SAME regardless of what changed: the
-    # changed-files list is computed by PAC itself (via
-    # {{ cel: files.all.join(",") }} in the app repo's .tekton/dispatch.yaml,
-    # the same job the old raw-Triggers design's GitHub interceptor
-    # addChangedFiles feature did — see commit 0e16247d/8e680b0a in the app
-    # repo's history) and handed to us as a plain param, so this Pipeline
-    # never needs to clone the repo or compute its own diff.
+    # config). This Pipeline is the SAME regardless of what changed: it clones
+    # the repo and diffs it itself to find out.
+    #
+    # NOTE on an approach that looked simpler but didn't work: PAC computes a
+    # changed-files list itself (files.all) and can, in principle, expose it
+    # via {{ cel: files.all.join(",") }} in a PipelineRun param — the same job
+    # the old raw-Triggers design's GitHub interceptor addChangedFiles feature
+    # did (see commit 0e16247d/8e680b0a in the app repo's history). Verified
+    # against a real cluster and a real GitHub App/webhook: on the deployed
+    # PAC version (v0.48.0), that param reliably evaluates to an empty string
+    # even for commits that clearly changed files — traced it to
+    # provider.GetFiles()'s caching (an earlier pre-match pass appears to
+    # cache an empty result before the real fetch runs, and every later call
+    # reuses that stale cache). Doing our own diff sidesteps that entirely.
     saritasa.dev/replaces: "static per-component PAC PipelineRun trigger files"
 spec:
   description: >-
     Entry point for every push/PR to the app repo (one PipelineRun, created
     directly by PAC from the app repo's single .tekton/dispatch.yaml trigger,
-    regardless of which or how many components changed). Takes the
-    already-computed changed-files list, detects which buildpack-ready
-    components were touched, resolves a resource tier per component, and
-    kubectl-creates one independent component-delivery PipelineRun per changed
-    component — so a commit touching N components fans out to N
-    independently-scheduled, independently-tiered builds. No clone here: this
-    Pipeline decides *what* to build, component-delivery clones and builds it.
+    regardless of which or how many components changed). Clones the repo with
+    enough history to diff against the target branch, detects which
+    buildpack-ready components the commit(s) touched, resolves a resource
+    tier per component, and kubectl-creates one independent
+    component-delivery PipelineRun per changed component — so a commit
+    touching N components fans out to N independently-scheduled,
+    independently-tiered builds.
   params:
-    - name: changed-files
-      type: string
-      description: Comma-separated list of file paths changed by this push/PR (from PAC's files.all)
-    - name: commit-sha
-      type: string
-      description: Git commit SHA to build from, forwarded to each dispatched PipelineRun
     - name: repo-url
       type: string
-      description: SSH clone URL, forwarded to each dispatched PipelineRun
+      description: SSH clone URL of the repository
+    - name: commit-sha
+      type: string
+      description: Git commit SHA to check out and build from
+    - name: target-branch
+      type: string
+      description: Branch this push/PR targets — used as the diff base to find changed files
+    - name: event-type
+      type: string
+      description: "push or pull_request — pull_request diffs against the target branch's merge-base; push diffs against the previous commit"
     - name: github-user
       type: string
       description: GHCR username — used to build each component's image-ref
@@ -45,17 +55,50 @@ spec:
       type: string
       description: Kubernetes namespace forwarded to each dispatched PipelineRun
       default: dev
+  workspaces:
+    - name: source
+      description: PVC shared between fetch-source and collect-and-dispatch — the same clone is reused for diffing, no second clone
+    - name: git-credentials
+      description: Secret containing the SSH key for git-clone
   tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source
+        - name: ssh-directory
+          workspace: git-credentials
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.commit-sha)
+        - name: refspec
+          value: "refs/heads/$(params.target-branch):refs/remotes/origin/$(params.target-branch)"
+        - name: submodules
+          value: "false"
+        - name: depth
+          # Deep enough to find the merge-base with the target branch for any
+          # realistic PR/push in this sample repo, shallow enough to stay fast.
+          value: "50"
+
     - name: collect-and-dispatch
+      runAfter: [fetch-source]
       taskRef:
         name: collect-and-dispatch
+      workspaces:
+        - name: source
+          workspace: source
       params:
-        - name: changed-files
-          value: $(params.changed-files)
-        - name: commit-sha
-          value: $(params.commit-sha)
         - name: repo-url
           value: $(params.repo-url)
+        - name: commit-sha
+          value: $(params.commit-sha)
+        - name: target-branch
+          value: $(params.target-branch)
+        - name: event-type
+          value: $(params.event-type)
         - name: github-user
           value: $(params.github-user)
         - name: deploy-namespace
