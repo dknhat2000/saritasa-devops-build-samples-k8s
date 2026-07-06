@@ -12,9 +12,13 @@ see "Why everything is pre-applied" below for why that's a requirement, not a
 style choice.
 
 Only one file lives in the app repo's `.tekton/` instead: `dispatch.yaml`, a
-`PipelineRun` referencing this repo's `dispatch` Pipeline by name. Pipelines-as-
-Code (PAC) creates that one PipelineRun on every push/PR, regardless of which
-or how many components changed.
+`PipelineRun` referencing this repo's `dispatch` Pipeline. Pipelines-as-Code
+(PAC) creates that one PipelineRun on every push/PR, regardless of which or
+how many components changed — resolving `dispatch` and `collect-and-dispatch`
+via `pipelinesascode.tekton.dev/pipeline`/`.../task` annotations pointing at
+this repo's raw GitHub URLs (see "Why everything is pre-applied" for why a
+plain `pipelineRef: name: dispatch` isn't enough on its own, even though
+`dispatch` is also pre-applied to the cluster).
 
 ## Dynamic component detection
 
@@ -54,15 +58,28 @@ builder image chosen.
 
 ## Why everything is pre-applied
 
-`collect-and-dispatch` creates PipelineRuns with a plain `kubectl create`,
-bypassing PAC entirely. PAC's per-run resolution of Pipeline/Task definitions
-straight from the source repo's `.tekton/` (no cluster RBAC needed) only
-happens for PipelineRuns **PAC itself** creates from watching that directory —
-that's just the one `dispatch` PipelineRun per push. Every PipelineRun
-`collect-and-dispatch` creates after that references `component-delivery` and
-`buildpacks` **by name**, so those must already exist in the cluster —
-`setup.sh` applies them once, the same way it already applied the community
-catalog's `git-clone`/`kubernetes-actions` Tasks.
+Two different resolution paths are at work here, and they don't mix:
+
+- **The one `dispatch` PipelineRun PAC creates itself**, from watching the app
+  repo's `.tekton/dispatch.yaml`. PAC resolves `pipelineRef`/`taskRef` for a
+  PipelineRun it creates this way **only** from local files sitting in
+  `.tekton/` at the trigger commit, or from
+  `pipelinesascode.tekton.dev/pipeline`/`.../task` URL annotations on that
+  same file — confirmed the hard way: with only `pipelineRef: name: dispatch`
+  and `dispatch` already applied to the cluster, PAC still failed with
+  `cannot find referenced pipeline dispatch`. **It never falls back to a
+  cluster-side lookup by name**, no matter what's already applied. So
+  `.tekton/dispatch.yaml` in the app repo carries the URL annotations
+  pointing here, even though `dispatch` is *also* pre-applied below — the
+  pre-apply alone doesn't help PAC find it.
+- **Every PipelineRun `collect-and-dispatch` creates after that**, with a
+  plain `kubectl create` that bypasses PAC entirely. Plain Tekton has no such
+  restriction: `pipelineRef: name: component-delivery` resolves normally
+  against whatever's already in the cluster. That's why `component-delivery`
+  and `buildpacks` are pre-applied by `setup.sh` (the same way it already
+  applies the community catalog's `git-clone`/`kubernetes-actions` Tasks) and
+  *not* referenced via URL annotation anywhere — for this path, pre-applying
+  is both necessary and sufficient.
 
 ## Layout
 
