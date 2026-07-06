@@ -1,0 +1,7 @@
+apiVersion: pipelinesascode.tekton.dev/v1alpha1
+kind: Repository
+metadata:
+  name: saritasa-devops-build-samples
+spec:
+  url: "https://github.com/dknhat2000/saritasa-devops-build-samples"
+  concurrency_limit: 4

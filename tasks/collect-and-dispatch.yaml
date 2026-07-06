@@ -1,0 +1,190 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: collect-and-dispatch
+  labels:
+    app.kubernetes.io/part-of: saritasa-cicd
+spec:
+  description: >-
+    Maps a comma-separated changed-files list (computed by PAC, not by this
+    Task — see pipelines/dispatch.yaml) to buildpack-ready components, resolves
+    a resource tier per component, and creates one independent
+    component-delivery PipelineRun per changed component. This replaces a
+    static PAC on-path-change trigger file per component: adding a new
+    component under an already-recognized ecosystem (e.g. go/new-thing) needs
+    zero Tekton configuration; adding a brand new ecosystem needs one new line
+    in the tier_for()/tier_values() lookup below — which is unavoidable
+    anyway, since a new ecosystem also needs its own Paketo builder image
+    chosen.
+  params:
+    - name: changed-files
+      type: string
+      description: Comma-separated list of changed file paths (from PAC's files.all)
+    - name: repo-url
+      type: string
+      description: SSH clone URL, forwarded into each dispatched PipelineRun
+    - name: commit-sha
+      type: string
+      description: Commit SHA being built, forwarded into each dispatched PipelineRun
+    - name: namespace
+      type: string
+      description: Namespace to create component-delivery PipelineRuns in
+      default: tekton
+    - name: deploy-namespace
+      type: string
+      description: Namespace forwarded to each dispatched PipelineRun as deploy-namespace
+      default: dev
+    - name: github-user
+      type: string
+      description: GHCR username — used to build each component's image-ref
+  steps:
+    - name: collect-and-dispatch
+      image: bitnami/kubectl:latest
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        NAMESPACE="$(params.namespace)"
+        DEPLOY_NAMESPACE="$(params.deploy-namespace)"
+        COMMIT_SHA="$(params.commit-sha)"
+        REPO_URL="$(params.repo-url)"
+        GITHUB_USER="$(params.github-user)"
+        CHANGED_FILES="$(params.changed-files)"
+
+        echo "[dispatch] commit=${COMMIT_SHA} changed-files=${CHANGED_FILES}"
+
+        if [[ -z "${CHANGED_FILES//[[:space:]]/}" ]]; then
+          echo "[dispatch] no changed files reported — nothing to build"
+          exit 0
+        fi
+
+        # Ecosystem allowlist -> resource tier. Directories not listed here
+        # (tests/, scripts/, kustomize/, docs, etc.) are infra, not components,
+        # and are silently ignored — they never produce a PipelineRun.
+        tier_for() {
+          case "$1" in
+            go) echo "light" ;;
+            python|php|ruby|web-servers) echo "standard" ;;
+            nodejs) echo "medium" ;;
+            java|dotnet-core) echo "heavy" ;;
+            *) echo "" ;;
+          esac
+        }
+
+        # tier -> "cpu-req cpu-lim mem-req mem-lim eph-req eph-lim layers-limit workspace-size bandwidth"
+        # See README.md "Resource tiers" for the rationale behind these numbers.
+        tier_values() {
+          case "$1" in
+            light)    echo "250m 1 256Mi 512Mi 256Mi 512Mi 512Mi 512Mi 10M" ;;
+            standard) echo "500m 1 512Mi 768Mi 512Mi 1Gi 1Gi 1Gi 15M" ;;
+            medium)   echo "500m 2 512Mi 1Gi 512Mi 2Gi 2Gi 2Gi 20M" ;;
+            heavy)    echo "1 3 1Gi 3Gi 1Gi 6Gi 6Gi 6Gi 40M" ;;
+          esac
+        }
+
+        declare -A seen
+        count=0
+
+        IFS=',' read -ra files <<< "${CHANGED_FILES}"
+        for f in "${files[@]}"; do
+          f="${f#"${f%%[![:space:]]*}"}"   # trim leading whitespace
+          [[ -z "${f}" ]] && continue
+          top="${f%%/*}"
+          rest="${f#*/}"
+          [[ "${rest}" == "${f}" ]] && continue   # file at repo root, not inside a component dir
+          second="${rest%%/*}"
+          tier="$(tier_for "${top}")"
+          [[ -z "${tier}" ]] && continue
+          component="${top}/${second}"
+          [[ -n "${seen[${component}]:-}" ]] && continue
+          seen["${component}"]=1
+
+          id="${component//\//-}"
+          read -r cpu_req cpu_lim mem_req mem_lim eph_req eph_lim layers_limit ws_size bandwidth <<< "$(tier_values "${tier}")"
+          image_ref="ghcr.io/${GITHUB_USER}/${id}:${COMMIT_SHA}"
+          count=$((count + 1))
+
+          echo "[dispatch] creating PipelineRun for component=${id} path=${component} tier=${tier} image=${image_ref}"
+
+          cat <<EOF | kubectl create -f -
+        apiVersion: tekton.dev/v1
+        kind: PipelineRun
+        metadata:
+          generateName: ${id}-
+          namespace: ${NAMESPACE}
+          labels:
+            app.kubernetes.io/part-of: saritasa-cicd
+            saritasa.dev/component: ${id}
+            saritasa.dev/resource-tier: ${tier}
+            saritasa.dev/pipeline-role: build-deploy
+          annotations:
+            # Best-effort, CNI-dependent — see README.md "Network bandwidth".
+            kubernetes.io/ingress-bandwidth: "${bandwidth}"
+            kubernetes.io/egress-bandwidth: "${bandwidth}"
+        spec:
+          timeouts:
+            pipeline: "10m0s"
+            tasks: "8m0s"
+          pipelineRef:
+            name: component-delivery
+          taskRunTemplate:
+            serviceAccountName: pipeline-sa
+          params:
+            - name: component-id
+              value: ${id}
+            - name: source-subpath
+              value: ${component}
+            - name: image-ref
+              value: ${image_ref}
+            - name: commit-sha
+              value: "${COMMIT_SHA}"
+            - name: repo-url
+              value: "${REPO_URL}"
+            - name: deploy-namespace
+              value: ${DEPLOY_NAMESPACE}
+            - name: build-cpu-request
+              value: "${cpu_req}"
+            - name: build-cpu-limit
+              value: "${cpu_lim}"
+            - name: build-memory-request
+              value: "${mem_req}"
+            - name: build-memory-limit
+              value: "${mem_lim}"
+            - name: build-ephemeral-storage-request
+              value: "${eph_req}"
+            - name: build-ephemeral-storage-limit
+              value: "${eph_lim}"
+            - name: layers-size-limit
+              value: "${layers_limit}"
+          workspaces:
+            - name: source
+              volumeClaimTemplate:
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  resources:
+                    requests:
+                      storage: ${ws_size}
+            - name: git-credentials
+              secret:
+                secretName: git-credentials
+            - name: dockerconfig
+              secret:
+                secretName: ghcr-credentials
+                items:
+                  - key: .dockerconfigjson
+                    path: config.json
+        EOF
+        done
+
+        if [[ "${count}" -eq 0 ]]; then
+          echo "[dispatch] no buildpack-ready components among the changed files — nothing to build"
+        else
+          echo "[dispatch] done — created ${count} component PipelineRun(s)"
+        fi

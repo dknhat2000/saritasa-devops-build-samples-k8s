@@ -1,0 +1,191 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildpacks
+  labels:
+    app.kubernetes.io/version: "0.6"
+  annotations:
+    tekton.dev/categories: Image Build
+    tekton.dev/pipelines.minVersion: "0.17.0"
+    tekton.dev/tags: image-build
+    tekton.dev/displayName: "Buildpacks"
+    tekton.dev/platforms: "linux/amd64"
+    saritasa.dev/source: "https://github.com/tektoncd/catalog/blob/main/task/buildpacks/0.6/buildpacks.yaml"
+spec:
+  description: >-
+    Builds source into a container image using Cloud Native Buildpacks.
+    Based on catalog v0.6 — create step runs as USER_ID:GROUP_ID to match
+    the builder image's CNB user (1001:1000 for builder-jammy-base).
+
+  workspaces:
+    - name: source
+    - name: cache
+      optional: true
+    - name: dockerconfig
+      optional: true
+
+  params:
+    - name: APP_IMAGE
+    - name: BUILDER_IMAGE
+    - name: SOURCE_SUBPATH
+      default: ""
+    - name: ENV_VARS
+      type: array
+      default: []
+    - name: PROCESS_TYPE
+      default: "web"
+    - name: RUN_IMAGE
+      default: ""
+    - name: CACHE_IMAGE
+      default: ""
+    - name: SKIP_RESTORE
+      default: "false"
+    - name: USER_ID
+      default: "1001"
+    - name: GROUP_ID
+      default: "1000"
+    - name: PLATFORM_DIR
+      default: empty-dir
+    # Resource-tier knobs (see saritasa.dev/resource-tier annotation on the
+    # calling Pipeline/PipelineRun for the rationale). Defaults below are the
+    # "standard" tier — components with a heavier or lighter dependency
+    # footprint override these from the Pipeline's build-* params.
+    - name: BUILD_CPU_REQUEST
+      default: "500m"
+    - name: BUILD_CPU_LIMIT
+      default: "1"
+    - name: BUILD_MEMORY_REQUEST
+      default: "512Mi"
+    - name: BUILD_MEMORY_LIMIT
+      default: "768Mi"
+    - name: BUILD_EPHEMERAL_STORAGE_REQUEST
+      default: "512Mi"
+    - name: BUILD_EPHEMERAL_STORAGE_LIMIT
+      default: "1Gi"
+    - name: LAYERS_SIZE_LIMIT
+      default: "1Gi"
+
+  results:
+    - name: APP_IMAGE_DIGEST
+    - name: APP_IMAGE_URL
+
+  stepTemplate:
+    env:
+      - name: CNB_PLATFORM_API
+        value: "0.9"
+
+  steps:
+    - name: prepare
+      image: docker.io/library/bash:5.1.4@sha256:b208215a4655538be652b2769d82e576bc4d0a2bb132144c060efc5be8c3f5d6
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+      args:
+        - "--env-vars"
+        - "$(params.ENV_VARS[*])"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+        if [[ "$(workspaces.cache.bound)" == "true" ]]; then
+          chown -R "$(params.USER_ID):$(params.GROUP_ID)" "$(workspaces.cache.path)"
+        fi
+        for path in "/tekton/home" "/layers" "$(workspaces.source.path)"; do
+          chown -R "$(params.USER_ID):$(params.GROUP_ID)" "$path"
+          if [[ "$path" == "$(workspaces.source.path)" ]]; then
+            chmod 775 "$(workspaces.source.path)"
+          fi
+        done
+        parsing_flag=""
+        envs=()
+        for arg in "$@"; do
+          if [[ "$arg" == "--env-vars" ]]; then
+            parsing_flag="env-vars"
+          elif [[ "$parsing_flag" == "env-vars" ]]; then
+            envs+=("$arg")
+          fi
+        done
+        mkdir -p /platform/env
+        for env in "${envs[@]}"; do
+          IFS='=' read -r key value <<< "$env"
+          [[ "$key" != "" && "$value" != "" ]] && echo -n "$value" > "/platform/env/${key}"
+        done
+      volumeMounts:
+        - name: layers-dir
+          mountPath: /layers
+        - name: $(params.PLATFORM_DIR)
+          mountPath: /platform
+
+    - name: create
+      image: $(params.BUILDER_IMAGE)
+      # IfNotPresent, not Always: the builder image is the same
+      # (paketobuildpacks/builder-jammy-base) across every component. On the
+      # single-node local cluster this is built for, re-pulling a ~1GB+ image
+      # on every one of N concurrent component builds is the single biggest
+      # avoidable network cost in the pipeline — the node's local cache
+      # already gives us this for free after the first build.
+      imagePullPolicy: IfNotPresent
+      command: ["/cnb/lifecycle/creator"]
+      resources:
+        requests:
+          cpu: $(params.BUILD_CPU_REQUEST)
+          memory: $(params.BUILD_MEMORY_REQUEST)
+          ephemeral-storage: $(params.BUILD_EPHEMERAL_STORAGE_REQUEST)
+        limits:
+          cpu: $(params.BUILD_CPU_LIMIT)
+          memory: $(params.BUILD_MEMORY_LIMIT)
+          ephemeral-storage: $(params.BUILD_EPHEMERAL_STORAGE_LIMIT)
+      env:
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+      args:
+        - "-app=$(workspaces.source.path)/$(params.SOURCE_SUBPATH)"
+        - "-cache-dir=$(workspaces.cache.path)"
+        - "-cache-image=$(params.CACHE_IMAGE)"
+        - "-uid=$(params.USER_ID)"
+        - "-gid=$(params.GROUP_ID)"
+        - "-layers=/layers"
+        - "-platform=/platform"
+        - "-report=/layers/report.toml"
+        - "-process-type=$(params.PROCESS_TYPE)"
+        - "-skip-restore=$(params.SKIP_RESTORE)"
+        - "-previous-image=$(params.APP_IMAGE)"
+        - "-run-image=$(params.RUN_IMAGE)"
+        - "$(params.APP_IMAGE)"
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      volumeMounts:
+        - name: layers-dir
+          mountPath: /layers
+        - name: $(params.PLATFORM_DIR)
+          mountPath: /platform
+
+    - name: results
+      image: docker.io/library/bash:5.1.4@sha256:b208215a4655538be652b2769d82e576bc4d0a2bb132144c060efc5be8c3f5d6
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "200m"
+          memory: "128Mi"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+        grep "digest" /layers/report.toml | cut -d'"' -f2 | cut -d'"' -f2 | tr -d '\n' | tee "$(results.APP_IMAGE_DIGEST.path)"
+        echo -n "$(params.APP_IMAGE)" | tee "$(results.APP_IMAGE_URL.path)"
+      volumeMounts:
+        - name: layers-dir
+          mountPath: /layers
+
+  volumes:
+    - name: empty-dir
+      emptyDir:
+        sizeLimit: 256Mi
+    - name: layers-dir
+      emptyDir:
+        sizeLimit: $(params.LAYERS_SIZE_LIMIT)

@@ -1,0 +1,223 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: component-delivery
+  labels:
+    app.kubernetes.io/part-of: saritasa-cicd
+  annotations:
+    # Resource scarcity control (concurrent multi-component pushes) — this repo
+    # (saritasa-devops-build-samples-k8s) is the platform/cluster-bootstrap repo;
+    # it's pre-applied to the cluster by setup.sh. Every PipelineRun of this
+    # Pipeline is created dynamically by tasks/collect-and-dispatch.yaml (one
+    # per changed component, via plain `kubectl create` — see
+    # pipelines/dispatch.yaml), which is also what sets the build-* param
+    # values below per run, tiered by ecosystem.
+    #
+    # Covers four resource dimensions, not just cpu/memory — a Go binary and a
+    # future Java native-image build don't cost the same on any of them:
+    # - CPU / memory: build-cpu-*/build-memory-* params above, tiered per component
+    #   (see README.md "Resource tiers"), floored/ceilinged by the namespace
+    #   LimitRange in manifests/tekton/quota-tekton.yaml.
+    # - Storage: build-ephemeral-storage-*/layers-size-limit params above (bounds
+    #   the buildpacks /layers scratch volume) plus each PipelineRun's workspace
+    #   PVC size (bounds git-clone + dependency-install disk use, e.g. npm/maven
+    #   pulling gigabytes) — both tiered per component, see README.md.
+    # - Network bandwidth: best-effort kubernetes.io/{e,in}gress-bandwidth
+    #   annotations, set by collect-and-dispatch on each dispatched
+    #   PipelineRun's own metadata (Tekton propagates PipelineRun annotations
+    #   down to every TaskRun/Pod it creates — Tekton's PodTemplate type has
+    #   no generic annotations field, so this can't be done via podTemplate).
+    #   Enforcement depends on the CNI supporting the bandwidth annotation —
+    #   see README.md "Network bandwidth" for the caveat. Plus a structural
+    #   fix that helps regardless of CNI: the builder image is pulled with
+    #   imagePullPolicy: IfNotPresent (see tasks/buildpacks.yaml) so N
+    #   concurrent component builds share one cached pull instead of each
+    #   re-downloading the same ~1GB+ builder image.
+    # - Fan-out throttling: PAC's concurrency_limit (manifests/tekton/repository.yaml)
+    #   only gates the one `dispatch` PipelineRun per push/PR — it doesn't see
+    #   the component-delivery runs collect-and-dispatch creates directly, so
+    #   the namespace ResourceQuota/LimitRange above is what actually throttles
+    #   concurrent component builds (pods queue Pending, none fail).
+    saritasa.dev/resource-scarcity-control: "manifests/tekton/quota-tekton.yaml, per-component tiers set by tasks/collect-and-dispatch.yaml, documented in README.md"
+spec:
+  description: >-
+    Builds and delivers a single buildpack-ready component: clones the repo at
+    a specific commit SHA, builds the component's source subpath into an OCI
+    image with Paketo buildpacks, then applies/updates the component's
+    Deployment in the target namespace with the new image (no Service — see
+    README.md). One PipelineRun of this Pipeline is created dynamically per
+    changed component by tasks/collect-and-dispatch.yaml, so a commit touching
+    multiple components fans out to that many independent runs.
+  params:
+    - name: component-id
+      type: string
+      description: Component slug matching the Deployment name (e.g. go-no-imports)
+    - name: source-subpath
+      type: string
+      description: Directory within the repo containing the component (e.g. go/no-imports)
+    - name: image-ref
+      type: string
+      description: Full image reference to build and push (ghcr.io/<user>/<id>:<sha>)
+    - name: commit-sha
+      type: string
+      description: Git commit SHA to check out
+    - name: repo-url
+      type: string
+      description: SSH clone URL of the repository
+    - name: builder
+      type: string
+      description: Paketo builder image
+      default: paketobuildpacks/builder-jammy-base
+    - name: build-env
+      type: array
+      description: Build-time environment variables forwarded to pack (KEY=VALUE list)
+      default: []
+    - name: process-type
+      type: string
+      description: CNB default process type override (empty = use buildpack default)
+      default: ""
+    - name: deploy-namespace
+      type: string
+      description: Kubernetes namespace where the Deployment lives
+      default: dev
+    # Resource-tier params (see saritasa.dev/resource-tier annotation above):
+    # each PipelineRun overrides these to match its component's real dependency
+    # footprint (Go vs. Node vs. a future Java/native-image component) instead
+    # of every component paying for — or being capped to — the same footprint.
+    - name: build-cpu-request
+      type: string
+      description: "CPU request for the buildpacks create step (resource tier)"
+      default: "500m"
+    - name: build-cpu-limit
+      type: string
+      description: "CPU limit for the buildpacks create step (resource tier)"
+      default: "1"
+    - name: build-memory-request
+      type: string
+      description: "Memory request for the buildpacks create step (resource tier)"
+      default: "512Mi"
+    - name: build-memory-limit
+      type: string
+      description: "Memory limit for the buildpacks create step (resource tier)"
+      default: "768Mi"
+    - name: build-ephemeral-storage-request
+      type: string
+      description: "Ephemeral (node-local scratch disk) storage request for the buildpacks create step"
+      default: "512Mi"
+    - name: build-ephemeral-storage-limit
+      type: string
+      description: "Ephemeral (node-local scratch disk) storage limit for the buildpacks create step — caps dependency-install blowups (e.g. npm/maven pulling gigabytes)"
+      default: "1Gi"
+    - name: layers-size-limit
+      type: string
+      description: "Size cap on the buildpacks /layers emptyDir volume (build output + downloaded dependency layers)"
+      default: "1Gi"
+  workspaces:
+    - name: source
+      description: PVC shared across all pipeline steps
+    - name: git-credentials
+      description: Secret containing the SSH key for git-clone
+    - name: dockerconfig
+      description: Secret containing the Docker config for image push
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source
+        - name: ssh-directory
+          workspace: git-credentials
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.commit-sha)
+        - name: submodules
+          value: "false"
+        - name: depth
+          value: "1"
+
+    - name: build-image
+      runAfter: [fetch-source]
+      taskRef:
+        name: buildpacks
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+      params:
+        - name: APP_IMAGE
+          value: $(params.image-ref)
+        - name: BUILDER_IMAGE
+          value: $(params.builder)
+        - name: SOURCE_SUBPATH
+          value: $(params.source-subpath)
+        - name: ENV_VARS
+          value: $(params.build-env[*])
+        - name: PROCESS_TYPE
+          value: $(params.process-type)
+        - name: USER_ID
+          value: "1001"
+        - name: GROUP_ID
+          value: "1000"
+        - name: BUILD_CPU_REQUEST
+          value: $(params.build-cpu-request)
+        - name: BUILD_CPU_LIMIT
+          value: $(params.build-cpu-limit)
+        - name: BUILD_MEMORY_REQUEST
+          value: $(params.build-memory-request)
+        - name: BUILD_MEMORY_LIMIT
+          value: $(params.build-memory-limit)
+        - name: BUILD_EPHEMERAL_STORAGE_REQUEST
+          value: $(params.build-ephemeral-storage-request)
+        - name: BUILD_EPHEMERAL_STORAGE_LIMIT
+          value: $(params.build-ephemeral-storage-limit)
+        - name: LAYERS_SIZE_LIMIT
+          value: $(params.layers-size-limit)
+
+    - name: rollout
+      runAfter: [build-image]
+      taskRef:
+        name: kubernetes-actions
+      params:
+        - name: image
+          value: bitnami/kubectl:latest
+        - name: script
+          value: |
+            # kubectl apply is create-or-update: this is the component's Deployment
+            # definition, applied fresh every run with the new image baked in. There is no
+            # pre-applied "placeholder" manifest to depend on — if the Deployment was deleted
+            # or never existed, this run recreates it; if it exists, it's updated in place.
+            #
+            # No Service is created here — the dev namespace intentionally exposes nothing;
+            # this pipeline's job is proving the image builds and runs, not networking it.
+            cat <<EOF | kubectl apply -f -
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: $(params.component-id)
+              namespace: $(params.deploy-namespace)
+              labels:
+                app: $(params.component-id)
+                app.kubernetes.io/part-of: saritasa-cicd
+            spec:
+              replicas: 1
+              selector:
+                matchLabels:
+                  app: $(params.component-id)
+              template:
+                metadata:
+                  labels:
+                    app: $(params.component-id)
+                spec:
+                  imagePullSecrets:
+                    - name: ghcr-credentials
+                  containers:
+                    - name: $(params.component-id)
+                      image: $(params.image-ref)
+            EOF
+            kubectl rollout status deployment/$(params.component-id) \
+              -n $(params.deploy-namespace) \
+              --timeout=300s
